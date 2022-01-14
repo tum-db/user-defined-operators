@@ -1,0 +1,380 @@
+commit a1f2cfe16fd83cc60e39b2563f5b391bfc62e2c4
+Author: Moritz Sichert <sichert@in.tum.de>
+Date:   Tue Apr 13 16:06:37 2021 +0200
+
+    Added special Umbra glibc version to be used in UDOs
+
+diff --git a/Makeconfig b/Makeconfig
+index 0a4811b5e5..9591da681f 100644
+--- a/Makeconfig
++++ b/Makeconfig
+@@ -1007,7 +1007,7 @@ libtypes = $(foreach o,$(object-suffixes-for-libc),$(libtype$o))
+ # .op may be added to all-object-suffixes below.
+ all-object-suffixes := .o .os .oS
+ object-suffixes :=
+-CPPFLAGS-.o = $(pic-default)
++CPPFLAGS-.o = $(pic-default) -DUMBRA_GLIBC
+ # libc.a must be compiled with -fPIE/-fpie for static PIE.
+ CFLAGS-.o = $(filter %frame-pointer,$(+cflags)) $(pie-default)
+ libtype.o := lib%.a
+diff --git a/csu/libc-start.c b/csu/libc-start.c
+index feb0d7ce11..bd54c031bd 100644
+--- a/csu/libc-start.c
++++ b/csu/libc-start.c
+@@ -29,6 +29,7 @@
+ #include <libc-internal.h>
+ #include <elf/libc-early-init.h>
+ #include <stdbool.h>
++#include <umbra.h>
+ 
+ #include <elf/dl-tunables.h>
+ 
+@@ -126,7 +127,11 @@ STATIC int LIBC_START_MAIN (int (*main) (int, char **, char **
+ 			    void (*fini) (void),
+ 			    void (*rtld_fini) (void),
+ 			    void *stack_end)
++#ifndef UMBRA_GLIBC
+      __attribute__ ((noreturn));
++#else
++     ;
++#endif
+ 
+ 
+ /* Note: the fini parameter is ignored here for shared library.  It
+@@ -177,7 +182,7 @@ LIBC_START_MAIN (int (*main) (int, char **, char ** MAIN_AUXVEC_DECL),
+          information from auxv.  */
+ 
+       extern const ElfW(Ehdr) __ehdr_start
+-# if BUILD_PIE_DEFAULT
++# if BUILD_PIE_DEFAULT && !defined(UMBRA_GLIBC)
+ 	__attribute__ ((visibility ("hidden")));
+ # else
+ 	__attribute__ ((weak, visibility ("hidden")));
+@@ -205,42 +210,47 @@ LIBC_START_MAIN (int (*main) (int, char **, char ** MAIN_AUXVEC_DECL),
+   /* Perform IREL{,A} relocations.  */
+   ARCH_SETUP_IREL ();
+ 
+-  /* The stack guard goes into the TCB, so initialize it early.  */
+-  ARCH_SETUP_TLS ();
++  /* The Umbra linker sets up TLS correctly */
++  if (!__running_in_umbra()) {
++    /* The stack guard goes into the TCB, so initialize it early.  */
++    ARCH_SETUP_TLS ();
++  }
+ 
+   /* In some architectures, IREL{,A} relocations happen after TLS setup in
+      order to let IFUNC resolvers benefit from TCB information, e.g. powerpc's
+      hwcap and platform fields available in the TCB.  */
+   ARCH_APPLY_IREL ();
+ 
+-  /* Set up the stack checker's canary.  */
+-  uintptr_t stack_chk_guard = _dl_setup_stack_chk_guard (_dl_random);
++  if (!__running_in_umbra()) {
++    /* Set up the stack checker's canary.  */
++    uintptr_t stack_chk_guard = _dl_setup_stack_chk_guard (_dl_random);
+ # ifdef THREAD_SET_STACK_GUARD
+-  THREAD_SET_STACK_GUARD (stack_chk_guard);
++    THREAD_SET_STACK_GUARD (stack_chk_guard);
+ # else
+-  __stack_chk_guard = stack_chk_guard;
++    __stack_chk_guard = stack_chk_guard;
+ # endif
+ 
+ # ifdef DL_SYSDEP_OSCHECK
+-  {
+-    /* This needs to run to initiliaze _dl_osversion before TLS
+-       setup might check it.  */
+-    DL_SYSDEP_OSCHECK (__libc_fatal);
+-  }
++    {
++      /* This needs to run to initiliaze _dl_osversion before TLS
++         setup might check it.  */
++      DL_SYSDEP_OSCHECK (__libc_fatal);
++    }
+ # endif
+ 
+-  /* Initialize libpthread if linked in.  */
+-  if (__pthread_initialize_minimal != NULL)
+-    __pthread_initialize_minimal ();
++    /* Initialize libpthread if linked in.  */
++    if (__pthread_initialize_minimal != NULL)
++      __pthread_initialize_minimal ();
+ 
+-  /* Set up the pointer guard value.  */
+-  uintptr_t pointer_chk_guard = _dl_setup_pointer_guard (_dl_random,
+-							 stack_chk_guard);
++    /* Set up the pointer guard value.  */
++    uintptr_t pointer_chk_guard = _dl_setup_pointer_guard (_dl_random,
++							   stack_chk_guard);
+ # ifdef THREAD_SET_POINTER_GUARD
+-  THREAD_SET_POINTER_GUARD (pointer_chk_guard);
++    THREAD_SET_POINTER_GUARD (pointer_chk_guard);
+ # else
+-  __pointer_chk_guard_local = pointer_chk_guard;
++    __pointer_chk_guard_local = pointer_chk_guard;
+ # endif
++  }
+ 
+ #endif /* !SHARED  */
+ 
+@@ -266,7 +276,7 @@ LIBC_START_MAIN (int (*main) (int, char **, char ** MAIN_AUXVEC_DECL),
+      the standard file descriptors are not opened.  We have to do this
+      only for statically linked applications since otherwise the dynamic
+      loader did the work already.  */
+-  if (__builtin_expect (__libc_enable_secure, 0))
++  if (!__running_in_umbra() && __builtin_expect (__libc_enable_secure, 0))
+     __libc_check_standard_fds ();
+ #endif
+ 
+@@ -302,6 +312,14 @@ LIBC_START_MAIN (int (*main) (int, char **, char ** MAIN_AUXVEC_DECL),
+ #ifndef SHARED
+   _dl_debug_initialize (0, LM_ID_BASE);
+ #endif
++
++#ifdef UMBRA_GLIBC
++  if (__running_in_umbra())
++    /* The setup is done now. Don't actually call the main function when
++     * running in umbra */
++    return 0;
++#endif
++
+ #ifdef HAVE_CLEANUP_JMP_BUF
+   /* Memory for the cancellation buffer.  */
+   struct pthread_unwind_buf unwind_buf;
+diff --git a/elf/Makefile b/elf/Makefile
+index 5d666b1b0c..1984033d9d 100644
+--- a/elf/Makefile
++++ b/elf/Makefile
+@@ -90,6 +90,7 @@ endef
+ CFLAGS-.o += $(call elide-stack-protector,.o,$(elide-routines.os))
+ CFLAGS-.op += $(call elide-stack-protector,.op,$(elide-routines.os))
+ CFLAGS-.os += $(call elide-stack-protector,.os,$(all-rtld-routines))
++CFLAGS-.oU += $(call elide-stack-protector,.oU,$(elide-routines.os))
+ 
+ ifeq ($(unwind-find-fde),yes)
+ routines += unwind-dw2-fde-glibc
+diff --git a/elf/dl-support.c b/elf/dl-support.c
+index 7abb65d8e3..5f7ef63c26 100644
+--- a/elf/dl-support.c
++++ b/elf/dl-support.c
+@@ -43,6 +43,7 @@
+ #include <dl-vdso.h>
+ #include <dl-vdso-setup.h>
+ #include <dl-auxv.h>
++#include <umbra.h>
+ 
+ extern char *__progname;
+ char **_dl_argv = &__progname;	/* This is checked for some error messages.  */
+@@ -372,7 +373,7 @@ _dl_non_dynamic_init (void)
+ 	}
+ 
+ #if !HAVE_TUNABLES
+-      if (__access ("/etc/suid-debug", F_OK) != 0)
++      if (!__running_in_umbra() && __access ("/etc/suid-debug", F_OK) != 0)
+ 	__unsetenv ("MALLOC_CHECK_");
+ #endif
+     }
+diff --git a/elf/enbl-secure.c b/elf/enbl-secure.c
+index 9e47526bd3..dbb7d97bf1 100644
+--- a/elf/enbl-secure.c
++++ b/elf/enbl-secure.c
+@@ -25,6 +25,7 @@
+ #endif
+ #include <startup.h>
+ #include <libc-internal.h>
++#include <umbra.h>
+ 
+ /* If nonzero __libc_enable_secure is already set.  */
+ int __libc_enable_secure_decided;
+@@ -34,7 +35,7 @@ int __libc_enable_secure = 1;
+ void
+ __libc_init_secure (void)
+ {
+-  if (__libc_enable_secure_decided == 0)
++  if (!__running_in_umbra() && __libc_enable_secure_decided == 0)
+     __libc_enable_secure = (startup_geteuid () != startup_getuid ()
+ 			    || startup_getegid () != startup_getgid ());
+ }
+diff --git a/malloc/malloc.c b/malloc/malloc.c
+index 1f4bbd8edf..77f370f630 100644
+--- a/malloc/malloc.c
++++ b/malloc/malloc.c
+@@ -5860,11 +5860,11 @@ weak_alias (__malloc_info, malloc_info)
+ 
+ 
+ strong_alias (__libc_calloc, __calloc) weak_alias (__libc_calloc, calloc)
+-strong_alias (__libc_free, __free) strong_alias (__libc_free, free)
+-strong_alias (__libc_malloc, __malloc) strong_alias (__libc_malloc, malloc)
++strong_alias (__libc_free, __free) weak_alias (__libc_free, free)
++strong_alias (__libc_malloc, __malloc) weak_alias (__libc_malloc, malloc)
+ strong_alias (__libc_memalign, __memalign)
+ weak_alias (__libc_memalign, memalign)
+-strong_alias (__libc_realloc, __realloc) strong_alias (__libc_realloc, realloc)
++strong_alias (__libc_realloc, __realloc) weak_alias (__libc_realloc, realloc)
+ strong_alias (__libc_valloc, __valloc) weak_alias (__libc_valloc, valloc)
+ strong_alias (__libc_pvalloc, __pvalloc) weak_alias (__libc_pvalloc, pvalloc)
+ strong_alias (__libc_mallinfo, __mallinfo)
+diff --git a/misc/Makefile b/misc/Makefile
+index b08d7c68ab..a92c173203 100644
+--- a/misc/Makefile
++++ b/misc/Makefile
+@@ -139,8 +139,10 @@ CFLAGS-fsync.c += -fexceptions -fasynchronous-unwind-tables
+ # off for non-shared builds.
+ CFLAGS-sbrk.o = $(no-stack-protector)
+ CFLAGS-sbrk.op = $(no-stack-protector)
++CFLAGS-sbrk.oU = $(no-stack-protector)
+ CFLAGS-brk.o = $(no-stack-protector)
+ CFLAGS-brk.op = $(no-stack-protector)
++CFLAGS-brk.oU = $(no-stack-protector)
+ 
+ include ../Rules
+ 
+diff --git a/nptl/alloca_cutoff.c b/nptl/alloca_cutoff.c
+index e13ec86a32..2018bd9335 100644
+--- a/nptl/alloca_cutoff.c
++++ b/nptl/alloca_cutoff.c
+@@ -20,11 +20,15 @@
+ #include <stdlib.h>
+ #include <sys/param.h>
+ #include <pthreadP.h>
++#include <umbra.h>
+ 
+ 
+ int
+ __libc_alloca_cutoff (size_t size)
+ {
++  if (__running_in_umbra())
++    return size <= __MAX_ALLOCA_CUTOFF;
++
+   return size <= (MIN (__MAX_ALLOCA_CUTOFF,
+ 		       THREAD_GETMEM (THREAD_SELF, stackblock_size) / 4
+ 		       /* The main thread, before the thread library is
+diff --git a/sysdeps/generic/umbra.h b/sysdeps/generic/umbra.h
+new file mode 100644
+index 0000000000..c7cd94f436
+--- /dev/null
++++ b/sysdeps/generic/umbra.h
+@@ -0,0 +1,33 @@
++/* Copyright (C) 2021 Moritz Sichert
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#ifndef _LIBC_UMBRA_H
++#define _LIBC_UMBRA_H 1
++
++#if defined(UMBRA_GLIBC) && !defined(SHARED)
++__attribute__((weak)) __attribute__((visibility("hidden"))) extern const int __umbra_glibc;
++
++__attribute__((always_inline)) static inline int __running_in_umbra(void) {
++   return !!(&__umbra_glibc);
++}
++#else
++__attribute__((always_inline)) static inline int __running_in_umbra(void) {
++   return 0;
++}
++#endif
++
++#endif
+diff --git a/sysdeps/nptl/pthread.h b/sysdeps/nptl/pthread.h
+index a04a3a2754..80a0fd3f8e 100644
+--- a/sysdeps/nptl/pthread.h
++++ b/sysdeps/nptl/pthread.h
+@@ -539,6 +539,7 @@ struct __pthread_cleanup_frame
+   int __cancel_type;
+ };
+ 
++#ifndef UMBRA_GLIBC
+ #if defined __GNUC__ && defined __EXCEPTIONS
+ # ifdef __cplusplus
+ /* Class to handle cancellation handler invocation.  */
+@@ -731,6 +732,14 @@ extern void __pthread_unwind_next (__pthread_unwind_buf_t *__buf)
+ # endif
+      ;
+ #endif
++#else
++#define pthread_cleanup_push(routine, arg) (void)(routine); (void)(arg)
++#define pthread_cleanup_pop(execute) (void)(execute)
++#ifdef __USE_GNU
++#define pthread_cleanup_push_defer_np(routine, arg) (void)(routine); (void)(arg)
++#define pthread_cleanup_pop_restore_np(execute) (void)(execute)
++#endif
++#endif /* UMBRA_GLIBC */
+ 
+ /* Function used in the macros.  Calling __sigsetjmp, with its first
+    argument declared as an array, results in a -Wstringop-overflow
+diff --git a/sysdeps/unix/sysv/linux/dl-origin.c b/sysdeps/unix/sysv/linux/dl-origin.c
+index 9f749e0251..40ed34d5d1 100644
+--- a/sysdeps/unix/sysv/linux/dl-origin.c
++++ b/sysdeps/unix/sysv/linux/dl-origin.c
+@@ -24,6 +24,7 @@
+ #include <sys/param.h>
+ #include <ldsodefs.h>
+ #include <sysdep.h>
++#include <umbra.h>
+ 
+ #include <dl-dst.h>
+ 
+@@ -34,6 +35,9 @@
+ const char *
+ _dl_get_origin (void)
+ {
++  if (__running_in_umbra())
++    return (char *) -1;
++
+   char linkval[PATH_MAX];
+   char *result;
+   int len;
+diff --git a/sysdeps/unix/sysv/linux/single-thread.h b/sysdeps/unix/sysv/linux/single-thread.h
+index a28aaed04d..ddd691c4d5 100644
+--- a/sysdeps/unix/sysv/linux/single-thread.h
++++ b/sysdeps/unix/sysv/linux/single-thread.h
+@@ -27,6 +27,7 @@
+    The ABI might define SINGLE_THREAD_BY_GLOBAL to enable the single thread
+    check to use global variables instead of the pthread_t field.  */
+ 
++#ifndef UMBRA_GLIBC
+ #ifdef SINGLE_THREAD_BY_GLOBAL
+ # if IS_IN (libc)
+ extern int __libc_multiple_threads;
+@@ -58,5 +59,9 @@ extern int __pthread_multiple_threads;
+ #define RTLD_SINGLE_THREAD_P \
+   __glibc_likely (THREAD_GETMEM (THREAD_SELF, \
+ 				 header.multiple_threads) == 0)
++#else
++#define SINGLE_THREAD_P (0)
++#define RTLD_SINGLE_THREAD_P (0)
++#endif /* UMBRA_GLIBC*/
+ 
+ #endif /* _SINGLE_THREAD_H  */
+diff --git a/sysdeps/unix/sysv/linux/x86/cpu-features.c b/sysdeps/unix/sysv/linux/x86/cpu-features.c
+index 60f766853d..c23d70cc78 100644
+--- a/sysdeps/unix/sysv/linux/x86/cpu-features.c
++++ b/sysdeps/unix/sysv/linux/x86/cpu-features.c
+@@ -19,10 +19,14 @@
+ #if CET_ENABLED
+ # include <sys/prctl.h>
+ # include <asm/prctl.h>
++# include <umbra.h>
+ 
+ static inline int __attribute__ ((always_inline))
+ get_cet_status (void)
+ {
++  if (__running_in_umbra())
++    return 0;
++
+   unsigned long long cet_status[3];
+   if (INTERNAL_SYSCALL_CALL (arch_prctl, ARCH_CET_STATUS, cet_status) == 0)
+     return cet_status[0];
