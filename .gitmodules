@@ -1,0 +1,3 @@
+[submodule "udo-runtime"]
+	path = udo-runtime
+	url = https://github.com/tum-db/udo-runtime.git
