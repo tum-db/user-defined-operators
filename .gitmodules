@@ -1,3 +1,7 @@
 [submodule "udo-runtime"]
 	path = udo-runtime
 	url = https://github.com/tum-db/udo-runtime.git
+[submodule "postgres"]
+	path = postgres
+	url = https://github.com/tum-db/postgres.git
+	branch = udo
