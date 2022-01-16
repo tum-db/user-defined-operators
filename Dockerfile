@@ -140,3 +140,18 @@ RUN cd /home/umbra/spark && sbt package
 WORKDIR /home/umbra
 
 COPY --chown=1000:1000 benchmarks.py postgresql.conf docker_createdb.sh docker_run_benchmarks.sh /home/umbra/
+
+# Install R
+USER root
+RUN \
+    apt-get update -qq && \
+    apt-get install -y r-base \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install R packages
+USER 1000
+COPY --chown=1000:1000 install_packages.R /home/umbra/
+RUN mkdir -p /home/umbra/R/x86_64-pc-linux-gnu-library/4.0
+RUN R --no-save < /home/umbra/install_packages.R
+
+COPY --chown=1000:1000 benchmarks.R generate_plots.sh /home/umbra/
