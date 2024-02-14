@@ -37,19 +37,11 @@ Next, fetch the submodules by running:
 $ git submodule update --init
 ```
 
-This will clone the git repositories for LLVM, Postgres, and the udo-runtime.
-Downloading the LLVM and Postgres repositories may take a while.
+This will clone the git repositories for Postgres and the udo-runtime.
 
 ### Build Docker Container
 
-You can either import the docker container from us or build it yourself. To
-import it from us, run the following command:
-
-```
-$ curl 'https://db.in.tum.de/~sichert/user-defined-operators.tar.gz' | docker load
-```
-
-To build the container yourself, run the following command in the root
+To build the container run the following command in the root
 directory of this git repository:
 
 ```
@@ -57,14 +49,11 @@ $ docker build -t user-defined-operators .
 ```
 
 This will:
-- Build an Ubuntu 21.04 image
-- Build LLVM
+- Build an Ubuntu 23.10 image
 - Build glibc and libc++
 - Build Postgres
 - Build udo-runtime
 - Install all other dependencies for the benchmarks
-
-Especially building LLVM takes a while. On our system this takes about 40 minutes.
 
 ### Run Benchmark Container
 

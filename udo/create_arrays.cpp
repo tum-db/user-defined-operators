@@ -34,13 +34,7 @@ static constexpr array invalidValues = {
     "nan"sv,
 };
 //---------------------------------------------------------------------------
-/// The output of this operator
-struct Output {
-   udo::String name;
-   udo::String values;
-};
-//---------------------------------------------------------------------------
-class CreateArrays : public udo::UDOperator<udo::EmptyTuple, Output> {
+class CreateArrays : public udo::UDOperator {
    private:
    /// The total number of tuples that should be generated
    uint64_t numTuples;
@@ -48,11 +42,17 @@ class CreateArrays : public udo::UDOperator<udo::EmptyTuple, Output> {
    atomic<uint64_t> tupleCount = 0;
 
    public:
+   using InputTuple = udo::EmptyTuple;
+   struct OutputTuple {
+      udo::String name;
+      udo::String values;
+   };
+
    /// Constructor
    explicit CreateArrays(uint64_t numTuples) : numTuples(numTuples) {}
 
    /// Produce the output
-   bool postProduce(LocalState& /*localState*/) {
+   bool process(udo::ExecutionState executionState) {
       uint64_t localTupleCount = tupleCount.fetch_add(10000);
       if (localTupleCount >= numTuples)
          return true;
@@ -82,15 +82,20 @@ class CreateArrays : public udo::UDOperator<udo::EmptyTuple, Output> {
             }
          }
 
-         Output output;
+         OutputTuple output;
          output.name = name;
          output.values = string_view(values);
 
-         produceOutputTuple(output);
+         emit<CreateArrays>(executionState, output);
       }
 
 
       return false;
    }
 };
+//---------------------------------------------------------------------------
+#ifdef WASMUDO
+// plugin-wasmudo -generate-cxx-header -no-destroy -no-accept CreateArrays 16 8 i64 '' 'name string,values string' > wasmudo_create_arrays.hpp
+#include "wasmudo_create_arrays.hpp"
+#endif
 //---------------------------------------------------------------------------

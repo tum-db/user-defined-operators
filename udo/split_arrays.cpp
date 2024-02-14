@@ -5,21 +5,20 @@
 //---------------------------------------------------------------------------
 using namespace std;
 //---------------------------------------------------------------------------
-struct InputTuple {
-   udo::String name;
-   udo::String values;
-};
-//---------------------------------------------------------------------------
-struct OutputTuple {
-   udo::String name;
-   int64_t value;
-};
-//---------------------------------------------------------------------------
-class SplitArrays : public udo::UDOperator<InputTuple, OutputTuple> {
-public:
-   void consume(LocalState& /*localState*/, const InputTuple& input) {
+class SplitArrays : public udo::UDOperator {
+   public:
+   struct InputTuple {
+      udo::String name;
+      udo::String values;
+   };
+   struct OutputTuple {
+      udo::String name;
+      int64_t value;
+   };
+
+   void accept(udo::ExecutionState executionState, const InputTuple& input) {
       OutputTuple output;
-      output.name = input.name;
+      output.name = static_cast<string_view>(input.name);
 
       string_view values = input.values;
 
@@ -32,7 +31,7 @@ public:
             if (currentValueBegin != currentValueEnd) {
                auto result = from_chars(currentValueBegin, currentValueEnd, output.value);
                if (result.ptr == currentValueEnd)
-                  produceOutputTuple(output);
+                  emit<SplitArrays>(executionState, output);
             }
 
             currentValueBegin = it + 1;
@@ -40,3 +39,9 @@ public:
       }
    }
 };
+//---------------------------------------------------------------------------
+#ifdef WASMUDO
+// plugin-wasmudo -generate-cxx-header -no-init -no-destroy -no-process SplitArrays 1 1 '' string,string 'name string,value i64' > wasmudo_split_arrays.hpp
+#include "wasmudo_split_arrays.hpp"
+#endif
+//---------------------------------------------------------------------------

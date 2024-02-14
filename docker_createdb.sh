@@ -13,7 +13,7 @@ cp ./postgresql.conf ./benchmarks/postgres/data
 
 /opt/postgres/bin/pg_ctl start -D ./benchmarks/postgres/data
 function stop_postgres {
-    /opt/postgres/bin/pg_ctl stop -D ./benchmarks/postgres/data
+    /opt/postgres/bin/pg_ctl stop -D ./benchmarks/postgres/data -t 300
 }
 trap stop_postgres EXIT
 
@@ -27,6 +27,3 @@ trap stop_postgres EXIT
     none
 
 /opt/postgres/bin/psql -c vacuum udo_benchmarks
-
-./docker_compile_standalone.sh -o ./kmeans-standalone ./udo_kmeans.cpp
-./docker_compile_standalone.sh -o ./regression-standalone ./udo_regression.cpp

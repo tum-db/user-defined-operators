@@ -12,7 +12,7 @@ namespace udo {
 void printDebug(const char* msg, uint64_t size);
 //---------------------------------------------------------------------------
 /// Print a debug message
-void printDebug(std::string_view message) {
+inline void printDebug(std::string_view message) {
    printDebug(message.data(), message.size());
 }
 //---------------------------------------------------------------------------
@@ -78,34 +78,49 @@ class String {
 struct EmptyTuple {
 };
 //---------------------------------------------------------------------------
-template <typename IT, typename OT>
+/// The local state each worker can use.
+struct LocalState {
+   /// The actual data. It is aligned to 16B and is set to zero initially.
+   alignas(16) std::byte data[16];
+};
+//---------------------------------------------------------------------------
+/// The execution state of a UDO
+class ExecutionState {
+   private:
+   /// The internal state
+   void* data[2];
+
+   public:
+   ExecutionState() = delete;
+   ExecutionState(const ExecutionState&) = default;
+   ExecutionState& operator=(const ExecutionState&) = default;
+
+   /// Get the thread id of the current thread
+   uint32_t getThreadId();
+
+   /// Get the local state for the thread of this execution state
+   LocalState& getLocalState();
+};
+//---------------------------------------------------------------------------
 class UDOperator {
    public:
-   /// The input tuple type
-   using InputTuple = IT;
-   /// The output tuple type
-   using OutputTuple = OT;
-
-   /// The local state each worker can use.
-   struct LocalState {
-      /// The actual data. It is aligned to 16B and is set to zero initially.
-      alignas(16) std::byte data[16];
-   };
-
    /// The value returned by extraWork() when all work is done
    static constexpr uint32_t extraWorkDone = -1;
 
-   /// Produce a tuple as output
-   static void produceOutputTuple(const OutputTuple& output) noexcept;
+   /// Get the thread id from an execution state
+   static uint32_t getThreadId(ExecutionState executionState) {
+      return executionState.getThreadId();
+   }
 
-   /// Accept an incoming tuple
-   void consume(LocalState& /*localState*/, const InputTuple& /*input*/) {}
+   /// Get the local state from an execution state
+   static LocalState& getLocalState(ExecutionState executionState) {
+      return executionState.getLocalState();
+   }
 
-   /// Do some extra work after all input tuples were consumed
-   uint32_t extraWork(LocalState& /*localState*/, uint32_t /*stepId*/) { return extraWorkDone; }
-
-   /// Do work after all tuples were consumed and generate the output
-   bool postProduce(LocalState& /*localState*/) { return true; }
+   /// Emit a tuple of the output
+   template <typename Derived>
+      requires std::is_base_of_v<UDOperator, Derived>
+   static void emit(ExecutionState executionState, const typename Derived::OutputTuple& output) noexcept;
 };
 //---------------------------------------------------------------------------
 }

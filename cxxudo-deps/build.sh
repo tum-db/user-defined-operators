@@ -34,10 +34,23 @@ if (( BUILD_GLIBC )); then
 
     cd "$build_dir/glibc/build"
 
+    # Pretend that we are cross-compiling glibc. Otherwise, the build process
+    # will try to build several binaries that are linked to the libraries on
+    # the current system. We don't want that as we will use the glibc
+    # completely independent of the current system when compiling UDOs.
+    echo "cross-compiling=yes" > configparms
+
+    # If a C++ compiler is found, the glibc build tries to build some tools
+    # written in C++ but wants to link them with itself instead of the system
+    # glibc (even when cross compiling). This means that if the system
+    # stdlibc++ depends on a newer version of glibc, the build will fail. So,
+    # we just disable building those tools.
+    CXX=/bin/false \
     "$build_dir/glibc/git/configure" \
         --disable-static-pie \
         --disable-tunables \
         --enable-cet \
+        --disable-werror \
         --prefix="$install_prefix"
     make
     make install
@@ -59,6 +72,8 @@ if (( BUILD_LIBCXXABI || BUILD_LIBCXX )); then
     fi
 fi
 
+LIBCXX_FLAGS="-isystem '$install_prefix/include' -L '$install_prefix/lib' -DUMBRA_GLIBC"
+
 if (( BUILD_LIBCXXABI )); then
     mkdir -p "$build_dir/libcxx/libcxxabi-build"
     cd "$build_dir/libcxx/libcxxabi-build"
@@ -66,7 +81,8 @@ if (( BUILD_LIBCXXABI )); then
     cmake -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$install_prefix" \
-        -DCMAKE_CXX_FLAGS="-iprefix '$install_prefix/include' -L '$install_prefix/lib' -DUMBRA_GLIBC" \
+        -DCMAKE_CXX_FLAGS="$LIBCXX_FLAGS" \
+        -DCMAKE_CXX_COMPILER_WORKS=ON \
         -DLLVM_PATH="$build_dir/libcxx/git/llvm" \
         -DLLVM_INCLUDE_TESTS=OFF \
         -DLIBCXXABI_ENABLE_SHARED=OFF \
@@ -82,7 +98,8 @@ if (( BUILD_LIBCXX )); then
     cmake -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$install_prefix" \
-        -DCMAKE_CXX_FLAGS="-iprefix '$install_prefix/include' -L '$install_prefix/lib' -DUMBRA_GLIBC" \
+        -DCMAKE_CXX_FLAGS="$LIBCXX_FLAGS" \
+        -DCMAKE_CXX_COMPILER_WORKS=ON \
         -DLLVM_PATH="$build_dir/libcxx/git/llvm" \
         -DLLVM_INCLUDE_TESTS=OFF \
         -DLIBCXX_ENABLE_SHARED=OFF \

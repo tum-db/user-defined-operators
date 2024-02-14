@@ -8,16 +8,6 @@
 //---------------------------------------------------------------------------
 using namespace std;
 //---------------------------------------------------------------------------
-/// The output of this operator
-struct Output {
-   /// The x dimension of the point
-   double x;
-   /// The y dimension of the point
-   double y;
-   /// The cluster id from the cluster this point belongs to
-   uint32_t clusterId;
-};
-//---------------------------------------------------------------------------
 /// A 2D point
 struct Point2D {
    /// The x dimension
@@ -27,7 +17,7 @@ struct Point2D {
 };
 //---------------------------------------------------------------------------
 /// A generator for random 2D Points with a cluster id
-class CreatePoints : public udo::UDOperator<udo::EmptyTuple, Output> {
+class CreatePoints : public udo::UDOperator {
    private:
    /// The fixed cluster centers
    static constexpr array<Point2D, 10> clusterCenters{{
@@ -71,11 +61,21 @@ class CreatePoints : public udo::UDOperator<udo::EmptyTuple, Output> {
    atomic<uint32_t> nextClusterId = 0;
 
    public:
+   using InputTuple = udo::EmptyTuple;
+   struct OutputTuple {
+      /// The x dimension of the point
+      double x;
+      /// The y dimension of the point
+      double y;
+      /// The cluster id from the cluster this point belongs to
+      uint32_t clusterId;
+   };
+
    /// Constructor
    explicit CreatePoints(uint64_t numPoints) : numPoints(numPoints) {}
 
    /// Produce the output
-   bool postProduce(LocalState& /*localState*/) {
+   bool process(udo::ExecutionState executionState) {
       auto clusterId = nextClusterId.fetch_add(1);
       if (clusterId >= clusterCenters.size())
          return true;
@@ -89,14 +89,19 @@ class CreatePoints : public udo::UDOperator<udo::EmptyTuple, Output> {
       uint64_t numClusterPoints = ceil(numPoints * clusterPointsProportions[clusterId]);
 
       for (uint64_t i = 0; i < numClusterPoints; ++i) {
-         Output output;
+         OutputTuple output;
          output.x = xDist(gen);
          output.y = yDist(gen);
          output.clusterId = clusterId;
-         produceOutputTuple(output);
+         emit<CreatePoints>(executionState, output);
       }
 
       return false;
    }
 };
+//---------------------------------------------------------------------------
+#ifdef WASMUDO
+// plugin-wasmudo -generate-cxx-header -no-destroy -no-accept CreatePoints 16 8 i64 '' 'x f64,y f64,clusterId i32' > wasmudo_create_points.hpp
+#include "wasmudo_create_points.hpp"
+#endif
 //---------------------------------------------------------------------------

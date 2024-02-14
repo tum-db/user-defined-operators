@@ -32,6 +32,10 @@ LINEAR_REGRESSION_SIZES = (
     list(range(100_000_000, 1_000_000_000, 100_000_000)) +
     [1_000_000_000]
 )
+LINEAR_REGRESSION_SIZES_LARGE = (
+    list(range(2_000_000_000, 40_000_000_000, 2_000_000_000)) +
+    [40_000_000_000]
+)
 WORDS_SIZES = (
     list(range(100_000, 1_000_000, 100_000)) +
     list(range(1_000_000, 10_000_000, 1_000_000)) +
@@ -76,16 +80,23 @@ insert into array_values_{size}
 select name, values from create_arrays({size});
 '''
 
-UDO_KMEANS_SQL = '''\
+
+def get_kmeans_sql(mode, input_relation):
+    if mode in ('cxxudo', 'wasmudo'):
+        funcname = 'udo_kmeans'
+        if mode == 'wasmudo':
+            funcname = 'wasm_' + funcname
+        return f'''\
 with data as (
     select x, y, cast(cluster_id as bigint) as payload
     from {input_relation}
 )
 select "clusterId", count(*)
-from udo_kmeans(table (select * from data))
+from {funcname}(table (select * from data))
 group by "clusterId";
 '''
-KMEANS_UMBRA_SQL = '''\
+    elif mode == 'umbra':
+        return f'''\
 with data as (
     select x, y, cast(cluster_id as bigint) as payload
     from {input_relation}
@@ -94,35 +105,65 @@ select cluster_id, count(*)
 from umbra.kmeans(table (select * from data), 8 order by x, y)
 group by cluster_id;
 '''
+    else:
+        raise ValueError(f"invalid mode: {mode}")
 
-UDO_REGRESSION_SQL = '''\
-select * from udo_regression(table (select x, y from {input_relation}));
-'''
-REGRESSION_SQL = '''\
-select regr_intercept(y, x), regr_slope(y, x) from {input_relation};
-'''
-REGRESSION_UMBRA_SQL = '''\
-select * from umbra.linear_regression(table (select x, y from {input_relation}), 2);
-'''
 
-UDO_WORDS_SQL = '''\
+def get_regression_sql(mode, input_relation, repeat = 0):
+    query = ''
+    if repeat > 1:
+        query = 'with data(x,y) as (\n'
+        select_repeat = f'select x, y from {input_relation}\n'
+        query += 'union all\n'.join(select_repeat for _ in range(repeat))
+        query += ')\n'
+        input_relation = 'data'
+
+    if mode in ('cxxudo', 'wasmudo'):
+        funcname = 'udo_regression'
+        if mode == 'wasmudo':
+            funcname = 'wasm_' + funcname
+        return query + f'select * from {funcname}(table (select x, y from {input_relation}));\n'
+    elif mode == 'sql':
+        return query + f'select regr_intercept(y, x), regr_slope(y, x) from {input_relation};\n'
+    elif mode == 'umbra':
+        return query + f'select * from umbra.linear_regression(table (select x, y from {input_relation}), 2);\n'
+    else:
+        raise ValueError(f"invalid mode: {mode}")
+
+
+def get_words_sql(mode, input_relation):
+    if mode in ('cxxudo', 'wasmudo'):
+        funcname = 'contains_database'
+        if mode == 'wasmudo':
+            funcname = 'wasm_' + funcname
+        return f'''\
 select count(*)
-from contains_database(table (select word from {input_relation}));
+from {funcname}(table (select word from {input_relation}));
 '''
-WORDS_SQL = '''\
+    elif mode == 'sql':
+        return f'''\
 select count(*)
 from {input_relation}
 where word ilike '%database%';
 '''
+    else:
+        raise ValueError(f"invalid mode: {mode}")
 
-UDO_ARRAYS_SQL =  '''\
+
+def get_arrays_sql(mode, input_relation):
+    if mode in ('cxxudo', 'wasmudo'):
+        funcname = 'split_arrays'
+        if mode == 'wasmudo':
+            funcname = 'wasm_' + funcname
+        return f'''\
 select name, count(*)
-from split_arrays(table (select name, values from {input_relation}))
+from {funcname}(table (select name, values from {input_relation}))
 where value between 1000 and 2000
 group by name
 order by name;
 '''
-ARRAYS_RECURSIVE_SQL = '''\
+    elif mode == 'recursive_sql':
+        return f'''\
 with recursive split_arrays(name, value, tail) as (
     select c.name, NULL, c.values as tail from {input_relation} c
     union all
@@ -155,7 +196,8 @@ where value between 1000 and 2000
 group by name
 order by name;
 '''
-ARRAYS_POSTGRES_SQL = '''\
+    elif mode == 'postgres':
+        return f'''\
 with unnest_values(name, value) as (
     select name, string_to_table(values, ',') as value
     from {input_relation}
@@ -173,7 +215,8 @@ where value between 1000 and 2000
 group by name
 order by name;
 '''
-ARRAYS_DUCKDB_SQL = '''\
+    elif mode == 'duckdb':
+        return f'''\
 with unnest_values(name, value) as (
     select name, unnest(string_split(values, ',')) as value
     from {input_relation}
@@ -191,6 +234,8 @@ where value between 1000 and 2000
 group by name
 order by name;
 '''
+    else:
+        raise ValueError(f"invalid mode: {mode}")
 
 
 # List of (funcname, args, classname)
@@ -208,8 +253,9 @@ UDO_FUNCTIONS = [
 ]
 
 
-def generate_query(funcname, args, classname):
-    with open(f'{funcname}.cpp') as f:
+def generate_cxxudo_create_query(funcname, args, classname):
+    benchmark_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    with open(os.path.join(benchmark_dir, f'udo/{funcname}.cpp')) as f:
         code = f.read()
 
     return (
@@ -217,6 +263,13 @@ f'''create function {funcname}({args}) returns table language 'UDO-C++' as $$
 {code}
 $$, '{classname}';
 ''')
+
+
+def generate_wasmudo_create_query(funcname, args, classname):
+    benchmark_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    wasm_file = os.path.join(benchmark_dir, f'udo/wasm/{funcname}.wasm')
+
+    return f'''create function wasm_{funcname}({args}) returns table language 'udo-wasm' security definer as '{wasm_file}', '{classname}';\n'''
 
 
 class CoresInfo:
@@ -313,92 +366,112 @@ class CoresInfo:
         return picked_threads
 
 
-def check_umbra(proc, wait=False):
-    if wait:
-        if proc.wait() != 0:
-            raise RuntimeError(f'Umbra process exited with error code {proc.returncode}')
-    else:
-        if proc.poll() is not None:
-            raise RuntimeError(f'Umbra process exited unexpectedly with return code {proc.returncode}')
-
-
-def _start_sql_proc(args, **kwargs):
-    tmpfile = tempfile.TemporaryFile('w', encoding='utf8')
-    # We pass this file via fd to the umbra process, so create a new fd that
-    # the umbra process will use and make it inheritable.
-    umbra_tmpfile_fd = os.dup(tmpfile.fileno())
-    os.set_inheritable(umbra_tmpfile_fd, True)
-
-    env = os.environ.copy()
-    env.update({
-        'CODEGENRANDOMSEED': str(SEED),
-        'KMEANSFIXEDITERATIONS': '10',
-    })
-
-    popen_kwargs = {
-        'stdin': subprocess.PIPE,
-        'stdout': subprocess.PIPE,
-        'env': env,
-        'encoding': 'utf8',
-        'close_fds': True,
-        'pass_fds': [umbra_tmpfile_fd],
+class UmbraProcess:
+    UMBRA_DEFAULT_STARTUP_SETTINGS = {
+        'verbosity': 'warning',
     }
-    popen_kwargs.update(kwargs)
 
-    sql_proc = subprocess.Popen(args, **popen_kwargs)
+    UMBRA_DEFAULT_SETTINGS = {
+        'codegenrandomseed': SEED,
+        'kmeansFixedIterations': 10,
+    }
 
-    os.close(umbra_tmpfile_fd)
+    def __init__(self, cmdline, umbra_startup_settings=None, popen_kwargs=None):
+        env = os.environ.copy()
+        env.update({key.upper(): value for key, value in self.UMBRA_DEFAULT_STARTUP_SETTINGS.items()})
+        if umbra_startup_settings:
+            env.update(umbra_startup_settings)
 
-    check_umbra(sql_proc)
+        popen_all_kwargs = {
+            'stdin': subprocess.PIPE,
+            'stderr': subprocess.PIPE,
+            'env': env,
+            'close_fds': True,
+        }
+        if popen_kwargs:
+            popen_all_kwargs.update(popen_kwargs)
 
-    return sql_proc, tmpfile, umbra_tmpfile_fd
+        self.sql_proc = subprocess.Popen(cmdline, **popen_all_kwargs)
+
+        self.check()
+
+        for name, value in self.UMBRA_DEFAULT_SETTINGS.items():
+            self.set_setting(name, value)
+
+    def wait(self):
+        if self.sql_proc.wait() != 0:
+            raise RuntimeError(f'Umbra process exited with error code {self.sql_proc.returncode}')
+
+    def check(self):
+        if self.sql_proc.poll() is not None:
+            raise RuntimeError(f'Umbra process exited unexpectedly with return code {self.sql_proc.returncode}')
+
+    def close(self):
+        self.sql_proc.stdin.close()
+        self.wait()
+
+    def execute_statement(self, statement):
+        self.sql_proc.stdin.write(statement.encode('utf8'))
+        self.sql_proc.stdin.write(b'\\warn BENCHMARKS_STATEMENT_DONE\n')
+        self.sql_proc.stdin.flush()
+
+        while True:
+            line = self.sql_proc.stderr.readline()
+
+            for error in (b'ERROR', b'FATAL', b'PANIC'):
+                if line.startswith(error):
+                    # Forward potentially relevant error messages to stderr
+                    sys.stderr.buffer.write(line)
+                    sys.stderr.flush()
+                    self.check()
+                    raise RuntimeError('Umbra generated error')
+
+            if line.startswith(b'BENCHMARKS_STATEMENT_DONE'):
+                break
+
+            self.check()
+
+    def execute_large_statement(self, statement):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(statement.encode('utf8'))
+            f.flush()
+
+            self.execute_statement(f'\\i {f.name}\n')
+
+    def set_setting(self, name, value):
+        self.execute_statement(f'\\set {name} {value}\n')
 
 
 def create_umbra_db(umbra_sql, dbfile):
-    sql_proc, tmpfile, umbra_tmpfile_fd = _start_sql_proc([umbra_sql, '-createdb', dbfile])
-
-    sql_proc.stdin.write('\\o -\n')
-    sql_proc.stdin.flush()
-
-    def wait_umbra():
-        sql_proc.stdin.write('select 1;\n')
-        sql_proc.stdin.flush();
-        sql_proc.stdout.readline();
-        check_umbra(sql_proc)
+    umbra_proc = UmbraProcess([umbra_sql, '-createdb', dbfile], {'max_wal_size': '256M'})
 
     for funcname, args, classname in UDO_FUNCTIONS:
-        print(f'Create function {funcname}')
-        query = generate_query(funcname, args, classname)
-        sql_proc.stdin.write(query)
-        sql_proc.stdin.flush()
-        wait_umbra()
+        print(f'Create C++ function {funcname}')
+        query = generate_cxxudo_create_query(funcname, args, classname)
+        umbra_proc.execute_large_statement(query)
+
+    for funcname, args, classname in UDO_FUNCTIONS:
+        print(f'Create Wasm function {funcname}')
+        query = generate_wasmudo_create_query(funcname, args, classname)
+        umbra_proc.execute_large_statement(query)
 
     for size in KMEANS_SIZES + KMEANS_SIZES_LARGE:
         print(f'Create points_{size}')
-        sql_proc.stdin.write(CREATE_POINTS_SQL.format(size=size))
-        sql_proc.stdin.flush()
-        wait_umbra()
+        umbra_proc.execute_large_statement(CREATE_POINTS_SQL.format(size=size))
 
     for size in LINEAR_REGRESSION_SIZES:
         print(f'Create xy_{size}')
-        sql_proc.stdin.write(CREATE_XY_SQL.format(size=size))
-        sql_proc.stdin.flush()
-        wait_umbra()
+        umbra_proc.execute_large_statement(CREATE_XY_SQL.format(size=size))
 
     for size in WORDS_SIZES:
         print(f'Create words_{size}')
-        sql_proc.stdin.write(CREATE_WORDS_SQL.format(size=size))
-        sql_proc.stdin.flush()
-        wait_umbra()
+        umbra_proc.execute_large_statement(CREATE_WORDS_SQL.format(size=size))
 
     for size in ARRAYS_SIZES:
         print(f'Create array_values_{size}')
-        sql_proc.stdin.write(CREATE_ARRAYS_SQL.format(size=size))
-        sql_proc.stdin.flush()
-        wait_umbra()
+        umbra_proc.execute_large_statement(CREATE_ARRAYS_SQL.format(size=size))
 
-    sql_proc.stdin.close()
-    check_umbra(sql_proc, True)
+    umbra_proc.close()
 
 
 def create_postgres_db(conn):
@@ -406,7 +479,7 @@ def create_postgres_db(conn):
 
     for funcname, args, classname in UDO_FUNCTIONS:
         print(f'Create function {funcname}')
-        query = generate_query(funcname, args, classname)
+        query = generate_cxxudo_create_query(funcname, args, classname)
         cursor.execute(query)
         conn.commit()
 
@@ -430,39 +503,28 @@ def create_postgres_db(conn):
         cursor.execute(CREATE_ARRAYS_SQL.format(size=size))
         conn.commit()
 
+def run_umbra_benchmark(umbra_sql, dbfile, name, sizes, get_query, umbra_settings, num_iterations = 10, **popen_kwargs):
+    umbra_proc = UmbraProcess([umbra_sql, dbfile], popen_kwargs=popen_kwargs)
 
-def run_umbra_benchmark(umbra_sql, dbfile, name, sizes, get_query, umbra_settings, **popen_kwargs):
-    sql_proc, tmpfile, umbra_tmpfile_fd = _start_sql_proc([umbra_sql, dbfile], **popen_kwargs)
-
-    sql_proc.stdin.write('\\o -\n')
-    sql_proc.stdin.flush()
+    umbra_proc.execute_statement('\\o -\n')
 
     for setting_name, value in umbra_settings.items():
-        sql_proc.stdin.write(f'''set debug.{setting_name} = '{value}';\n''');
-        sql_proc.stdin.flush()
-        check_umbra(sql_proc)
+        umbra_proc.set_setting(setting_name, value);
 
     for size in sizes:
-        # Run query once without measurement to warm up system
+        # Run query once without measurement to warm up system and force the
+        # compilation of the function.
         query = get_query(size)
-        sql_proc.stdin.write(f'\\record off\n')
-        sql_proc.stdin.write(query)
-        sql_proc.stdin.flush()
-        sql_proc.stdout.readline()
-        check_umbra(sql_proc)
+        umbra_proc.execute_statement('\\record off\n')
+        umbra_proc.execute_large_statement(query)
 
-        sql_proc.stdin.write(f'\\record benchmarks.log {name}_{size}\n')
-        sql_proc.stdin.flush()
+        umbra_proc.execute_statement(f'\\record benchmarks.log {name}_{size}\n')
 
-        for i in range(10):
+        for i in range(num_iterations):
             print(f'Run umbra_{name}_{size} iteration {i+1}')
-            sql_proc.stdin.write(query)
-            sql_proc.stdin.flush()
-            sql_proc.stdout.readline()
-            check_umbra(sql_proc)
+            umbra_proc.execute_large_statement(query)
 
-    sql_proc.stdin.close()
-    check_umbra(sql_proc, True)
+    umbra_proc.close()
 
 
 def run_postgres_benchmark(conn, name, sizes, get_query):
@@ -506,26 +568,20 @@ def run_postgres_benchmark(conn, name, sizes, get_query):
 
 
 def run_standalone_benchmark(umbra_sql, dbfile, standalone_exe, name, sizes, get_relation):
-    sql_proc, tmpfile, umbra_tmpfile_fd = _start_sql_proc([umbra_sql, dbfile])
+    umbra_proc = UmbraProcess([umbra_sql, dbfile])
+    db_dir = os.path.dirname(os.path.abspath(dbfile))
 
-    sql_proc.stdin.write('\\o -\n')
-    sql_proc.stdin.flush()
+    umbra_proc.execute_statement('\\o -\n')
 
     if not os.path.exists('standalone-benchmarks.log'):
         with open('standalone-benchmarks.log', 'w') as log:
-            log.write('name,num_tuples,time_ns\n')
+            log.write('name,num_tuples,csvparse_ns,execution_ns\n')
 
     for size in sizes:
         relation = get_relation(size)
         print(f'Run standalone_{name}_{size}')
-        with tempfile.NamedTemporaryFile() as data_file:
-            sql_proc.stdin.write(f'''\
-copy {relation} to '{data_file.name}' csv header;
-''')
-            sql_proc.stdin.write('select 1;\n')
-            sql_proc.stdin.flush()
-            sql_proc.stdout.readline()
-            check_umbra(sql_proc)
+        with tempfile.NamedTemporaryFile(dir=db_dir) as data_file:
+            umbra_proc.execute_statement(f'''copy {relation} to '{data_file.name}' csv header;\n''')
 
             process_kwargs = {
                 'stdout': subprocess.PIPE,
@@ -536,11 +592,15 @@ copy {relation} to '{data_file.name}' csv header;
             proc = subprocess.run([standalone_exe, '--benchmark', data_file.name], **process_kwargs)
 
             with open('standalone-benchmarks.log', 'a') as log:
+                last_parse_ns = ''
                 for line in proc.stdout.splitlines():
-                    log.write(f'{name},{size},{line}\n')
+                    part, _, time_ns = line.partition(':')
+                    if part == 'parse':
+                        last_parse_ns = time_ns
+                    elif part == 'exec':
+                        log.write(f'{name},{size},{last_parse_ns},{time_ns}\n')
 
-    sql_proc.stdin.close()
-    check_umbra(sql_proc, True)
+    umbra_proc.close()
 
 
 def _run_spark(spark_submit, spark_class, *args):
@@ -558,10 +618,10 @@ def _run_spark(spark_submit, spark_class, *args):
 SPARK_TIME_RE = re.compile('Time taken: ([0-9]+) ms')
 
 def run_spark_benchmark(umbra_sql, dbfile, spark_submit, name, spark_class, get_relation, sizes):
-    sql_proc, tmpfile, umbra_tmpfile_fd = _start_sql_proc([umbra_sql, dbfile])
+    umbra_proc = UmbraProcess([umbra_sql, dbfile])
+    db_dir = os.path.dirname(os.path.abspath(dbfile))
 
-    sql_proc.stdin.write('\\o -\n')
-    sql_proc.stdin.flush()
+    umbra_proc.execute_statement('\\o -\n')
 
     if not os.path.exists('spark-benchmarks.log'):
         with open('spark-benchmarks.log', 'w') as log:
@@ -571,14 +631,8 @@ def run_spark_benchmark(umbra_sql, dbfile, spark_submit, name, spark_class, get_
         for size in sizes:
             relation = get_relation(size)
             print(f'Run spark_{name}_{size}')
-            with tempfile.NamedTemporaryFile() as data_file:
-                sql_proc.stdin.write(f'''\
-copy {relation} to '{data_file.name}' csv header;
-''')
-                sql_proc.stdin.write('select 1;\n')
-                sql_proc.stdin.flush()
-                sql_proc.stdout.readline()
-                check_umbra(sql_proc)
+            with tempfile.NamedTemporaryFile(dir=db_dir) as data_file:
+                umbra_proc.execute_statement(f'''copy {relation} to '{data_file.name}' csv header;\n''')
 
                 output = _run_spark(spark_submit, spark_class, data_file.name)
 
@@ -587,8 +641,7 @@ copy {relation} to '{data_file.name}' csv header;
                     time_ms = match.group(1)
                     log.write(f'{name},{size},{time_ms}\n')
 
-    sql_proc.stdin.close()
-    check_umbra(sql_proc, True)
+    umbra_proc.close()
 
 
 def _duckdb_benchmark(data_file, name, size, relation, query):
@@ -645,22 +698,15 @@ def can_import_duckb():
 
 
 def run_duckdb_benchmark(umbra_sql, dbfile, name, get_relation, get_query, sizes):
-    sql_proc, tmpfile, umbra_tmpfile_fd = _start_sql_proc([umbra_sql, dbfile])
+    umbra_proc = UmbraProcess([umbra_sql, dbfile])
 
-    sql_proc.stdin.write('\\o -\n')
-    sql_proc.stdin.flush()
+    umbra_proc.execute_statement('\\o -\n')
 
     for size in sizes:
         relation = get_relation(size)
         print(f'Run duckdb_{name}_{size}')
         with tempfile.NamedTemporaryFile() as data_file:
-            sql_proc.stdin.write(f'''\
-copy {relation} to '{data_file.name}' csv header;
-''')
-            sql_proc.stdin.write('select 1;\n')
-            sql_proc.stdin.flush()
-            sql_proc.stdout.readline()
-            check_umbra(sql_proc)
+            umbra_proc.execute_statement(f'''copy {relation} to '{data_file.name}' csv header;\n''')
 
             query = get_query(size)
             proc = multiprocessing.Process(target=_duckdb_benchmark, args=(data_file.name, name, size, relation, query))
@@ -669,27 +715,84 @@ copy {relation} to '{data_file.name}' csv header;
             if proc.exitcode != 0:
                 raise RuntimeError(f'duckdb process returned error code {proc.exitcode}')
 
-    sql_proc.stdin.close()
-    check_umbra(sql_proc, True)
+    umbra_proc.close()
+
+
+WASM_FULL_BOUNDSCHECKS_SETTINGS = {'wasm_disableboundschecks': 0, 'wasm_loop_optimization': 0, 'wasm_offset_optimization': 0}
+WASM_OPT_BOUNDSCHECKS_SETTINGS = {'wasm_disableboundschecks': 0, 'wasm_loop_optimization': 1, 'wasm_offset_optimization': 1}
+WASM_NO_BOUNDSCHECKS_SETTINGS = {'wasm_disableboundschecks': 1, 'wasm_loop_optimization': 0, 'wasm_offset_optimization': 0}
+WASM_SETTINGS = {
+    'full_boundschecks': WASM_FULL_BOUNDSCHECKS_SETTINGS,
+    'optimized_boundschecks': WASM_OPT_BOUNDSCHECKS_SETTINGS,
+    'no_boundschecks': WASM_NO_BOUNDSCHECKS_SETTINGS,
+}
 
 
 if __name__ == '__main__':
     import argparse
     import sys
 
-    if len(sys.argv) == 2 and sys.argv[1] == '--generate-queries':
-        for (funcname, args, classname) in UDO_FUNCTIONS:
-            query = generate_query(funcname, args, classname)
-            with open(f'{funcname}.sql', 'w') as f:
+    if sys.argv[1] == '--generate-queries':
+        import os
+        import shlex
+        import subprocess
+
+        parser = argparse.ArgumentParser(description='Generate the SQL files for the UDOs')
+        parser.add_argument('--generate-queries', action='store_true', help='Generate the SQL files for the UDOs')
+        parser.add_argument('--plugin-wasmudo', help='Path to the plugin-wasmudo binary')
+        parser.add_argument('--verbose', action='store_true', help='Print the commands that are used to compile the wasm functions')
+
+        args = parser.parse_args()
+
+        try:
+            os.mkdir('udo/sql')
+        except FileExistsError:
+            pass
+
+        for (funcname, func_args, classname) in UDO_FUNCTIONS:
+            query = generate_cxxudo_create_query(funcname, func_args, classname)
+            with open(f'udo/sql/{funcname}.sql', 'w') as f:
                 f.write(query)
+
+        if args.plugin_wasmudo:
+            try:
+                os.mkdir('udo/wasm')
+            except FileExistsError:
+                pass
+
+            cxx_cmdline = subprocess.run([args.plugin_wasmudo, '-cxx-cmdline'], stdout=subprocess.PIPE, text=True, check=True).stdout
+            cxx_cmdline = cxx_cmdline.splitlines()
+
+            for (funcname, _, _) in UDO_FUNCTIONS:
+                cpp_file = f'udo/{funcname}.cpp'
+                prefix = '// plugin-wasmudo'
+                wasmudo_cmds = None
+                for line in open(cpp_file):
+                    if line.startswith(prefix):
+                        wasmudo_cmds = shlex.split(line[len(prefix):])
+
+                if not wasmudo_cmds:
+                    continue
+
+                target_file = os.path.join('udo', 'wasm', wasmudo_cmds[-1])
+                wasmudo_cmds = wasmudo_cmds[:-2]
+                wasmudo_cmdline = [args.plugin_wasmudo] + wasmudo_cmds
+                with open(target_file, 'w') as output_file:
+                    subprocess.run(wasmudo_cmdline, stdout=output_file, check=True)
+
+                compiler_cmdline = cxx_cmdline + ['-std=c++20', '-Wall', '-Wextra', '-Wno-unqualified-std-cast-call', '-I./udo/wasm', '-DWASMUDO', '-O3', '-DNDEBUG', '-g0', '-Wl,--strip-debug', '-o', f'udo/wasm/{funcname}.wasm', cpp_file]
+                if args.verbose:
+                    print(shlex.join(compiler_cmdline))
+                subprocess.run(compiler_cmdline, check=True)
 
         sys.exit(0)
 
 
     ALL_BENCHMARKS = ['kmeans', 'regression', 'words', 'arrays', 'spark']
-    ALL_SYSTEMS = ['Umbra', 'Postgres', 'Spark', 'DuckDB', 'Standalone']
+    ALL_SYSTEMS = ['Umbra', 'Umbra-Wasm', 'Postgres', 'Spark', 'DuckDB', 'Standalone']
 
     parser = argparse.ArgumentParser(description='Run UDO benchmarks')
+    parser.add_argument('--generate-queries', action='store_true', help='Generate the SQL and wasm files for the UDOs')
     parser.add_argument('--createdb', help='Create the benchmark database', action='store_true')
     parser.add_argument('--umbra-sql', help='Path to the Umbra sql binary')
     parser.add_argument('--umbra-dbfile', help='Path to the Umbra database file')
@@ -717,49 +820,45 @@ if __name__ == '__main__':
                 sys.exit(2)
             selected_systems.add(system)
 
-    run_umbra = False
-    run_postgres = False
-    run_spark = False
-    run_duckdb = False
-    run_standalone = False
+    can_run_umbra = False
+    can_run_postgres = False
+    can_run_spark = False
+    can_run_duckdb = False
+    can_run_standalone = False
 
     if bool(args.umbra_sql) != bool(args.umbra_dbfile):
         print("--umbra-sql and --umbra-dbfile need to be specified together", file=sys.stderr)
         sys.exit(2)
     if args.umbra_sql:
-        run_umbra = True
+        can_run_umbra = True
 
     if args.postgres_connection is not None:
         postgres_conn = psycopg2.connect(args.postgres_connection)
-        run_postgres = True
+        can_run_postgres = True
 
-    if run_umbra:
+    if can_run_umbra:
         # The duckdb and spark and standalone benchmarks get their inputs from
         # the umbra process, so we need umbra.
 
         if can_import_duckb():
-            run_duckdb = True
+            can_run_duckdb = True
 
         if os.path.exists('./kmeans-standalone'):
-            run_standalone = True
+            can_run_standalone = True
 
         spark_home = args.spark_home
         if not spark_home:
             spark_home = os.environ.get('SPARK_HOME')
 
         if spark_home:
-            run_spark = True
+            can_run_spark = True
 
-    if 'umbra' not in selected_systems:
-        run_umbra = False
-    if 'postgres' not in selected_systems:
-        run_postgres = False
-    if 'spark' not in selected_systems:
-        run_spark = False
-    if 'duckdb' not in selected_systems:
-        run_duckdb = False
-    if 'standalone' not in selected_systems:
-        run_standalone = False
+    run_umbra = can_run_umbra and ('umbra' in selected_systems)
+    run_umbra_wasm = can_run_umbra and ('umbra-wasm' in selected_systems)
+    run_postgres = can_run_postgres and ('postgres' in selected_systems)
+    run_spark = can_run_spark and ('spark' in selected_systems)
+    run_duckdb = can_run_duckdb and ('duckdb' in selected_systems)
+    run_standalone = can_run_standalone and ('standalone' in selected_systems)
 
     if args.createdb:
         if run_umbra:
@@ -770,57 +869,89 @@ if __name__ == '__main__':
     if run_postgres:
         postgres_conn.set_session(readonly=True)
 
+    cores_info = CoresInfo()
+
     if 'kmeans' in benchmarks:
+        kmeans_sizes_all = KMEANS_SIZES + KMEANS_SIZES_LARGE
+        # A wasm module only has 4 GiB of memory and it needs to
+        # materialize the entire input. So, limit the size to 20M tuples.
+        # Each tuple requires around 32B of memory, so for 20M tuples we
+        # need ~600 MiB of memory. Because the tuples are allocated in
+        # exponentially growing chunks, we can't easily use up most of the
+        # 4 GiB of available memory.
+        wasmudo_kmeans_max_tuples = 20_000_000
+        kmeans_sizes_wasmudo = [s for s in kmeans_sizes_all if s <= wasmudo_kmeans_max_tuples]
+
+        def run_umbra_kmeans(name, compilationmode, umbra_settings = None):
+            if name.startswith('wasmudo'):
+                sizes = kmeans_sizes_wasmudo
+                mode = 'wasmudo'
+            else:
+                sizes = kmeans_sizes_all
+                mode = name
+            settings = {'compilationmode': 'o', 'llvmoptimizer': 3}
+            if umbra_settings:
+                settings.update(umbra_settings)
+            return run_umbra_benchmark(
+                args.umbra_sql,
+                args.umbra_dbfile,
+                name + '_kmeans',
+                sizes,
+                lambda s: get_kmeans_sql(mode, f'points_{s}'),
+                settings
+            )
+
         if run_umbra:
-            def run_kmeans(name, query, compilationmode):
-                return run_umbra_benchmark(
+            run_umbra_kmeans('cxxudo', 'o')
+            run_umbra_kmeans('umbra', 'o')
+        if run_umbra_wasm:
+            for name, settings in WASM_SETTINGS.items():
+                run_umbra_kmeans(f'wasmudo_{name}', 'o', settings)
+
+        def run_umbra_kmeans_threads(name, size, umbra_settings = None):
+            if name.startswith('wasmudo'):
+                mode = 'wasmudo'
+            else:
+                mode = name
+            settings = {'compilationmode': 'o', 'llvmoptimizer': 3}
+            if umbra_settings:
+                settings.update(umbra_settings)
+            for num_threads in range(2, cores_info.get_num_threads() + 1, 2):
+                settings['parallel'] = str(num_threads)
+                thread_list = cores_info.pick_threads(num_threads)
+                run_umbra_benchmark(
                     args.umbra_sql,
                     args.umbra_dbfile,
-                    name,
-                    KMEANS_SIZES + KMEANS_SIZES_LARGE,
-                    lambda s: query.format(input_relation=f'points_{s}'),
-                    {'compilationmode': compilationmode}
+                    name + '_kmeans_threads',
+                    [size],
+                    lambda s: get_kmeans_sql(mode, f'points_{s}'),
+                    settings,
+                    min(10, num_threads // 2),
+                    preexec_fn = lambda: os.sched_setaffinity(0, thread_list)
                 )
-            run_kmeans('udo_kmeans', UDO_KMEANS_SQL, 'o')
-            run_kmeans('kmeans', KMEANS_UMBRA_SQL, 'o')
 
-            cores_info = CoresInfo()
-
-            def run_kmeans_threads(name, query):
-                for num_threads in range(2, cores_info.get_num_threads() + 1, 2):
-                    thread_list = cores_info.pick_threads(num_threads)
-                    run_umbra_benchmark(
-                        args.umbra_sql,
-                        args.umbra_dbfile,
-                        name,
-                        [KMEANS_SIZES_LARGE[-1]],
-                        lambda s: query.format(input_relation=f'points_{s}'),
-                        {
-                            'compilationmode': 'o',
-                            'parallel': str(num_threads),
-                        },
-                        preexec_fn = lambda: os.sched_setaffinity(0, thread_list)
-                    )
-            run_kmeans_threads('udo_kmeans_threads', UDO_KMEANS_SQL)
-            run_kmeans_threads('kmeans_threads', KMEANS_UMBRA_SQL)
+        if run_umbra:
+            run_umbra_kmeans_threads('cxxudo', KMEANS_SIZES_LARGE[-1])
+            run_umbra_kmeans_threads('umbra', KMEANS_SIZES_LARGE[-1])
+        if run_umbra_wasm:
+            for name, settings in WASM_SETTINGS.items():
+                run_umbra_kmeans_threads(f'wasmudo_{name}', wasmudo_kmeans_max_tuples, settings)
 
         if run_postgres:
-            def run_kmeans(name, query):
-                return run_postgres_benchmark(
-                    postgres_conn,
-                    name,
-                    KMEANS_SIZES,
-                    lambda s: query.format(input_relation=f'points_{s}')
-                )
-            run_kmeans('udo_kmeans', UDO_KMEANS_SQL)
+            run_postgres_benchmark(
+                postgres_conn,
+                'cxxudo_kmeans',
+                KMEANS_SIZES,
+                lambda s: get_kmeans_sql('cxxudo', f'points_{s}')
+            )
 
         if run_standalone:
             run_standalone_benchmark(
                 args.umbra_sql,
                 args.umbra_dbfile,
                 './kmeans-standalone',
-                'udo_kmeans',
-                KMEANS_SIZES,
+                'cxxudo_kmeans',
+                KMEANS_SIZES + KMEANS_SIZES_LARGE,
                 lambda s: f'points_{s}'
             )
 
@@ -836,60 +967,91 @@ if __name__ == '__main__':
             )
 
     if 'regression' in benchmarks:
+        def get_regression_sql_repeat(mode, size):
+            relation_size = min(size, LINEAR_REGRESSION_SIZES[-1])
+            repeat = size // LINEAR_REGRESSION_SIZES[-1]
+            return get_regression_sql(mode, f'xy_{relation_size}', repeat=repeat)
+
+        def run_umbra_regression(name, large, umbra_settings = None):
+            if name.startswith('wasmudo'):
+                mode = 'wasmudo'
+            else:
+                mode = name
+            settings = {'compilationmode': 'o', 'llvmoptimizer': 3}
+            if umbra_settings:
+                settings.update(umbra_settings)
+
+            sizes = LINEAR_REGRESSION_SIZES
+            if large:
+                sizes = sizes + LINEAR_REGRESSION_SIZES_LARGE
+            return run_umbra_benchmark(
+                args.umbra_sql,
+                args.umbra_dbfile,
+                name + '_regression',
+                sizes,
+                lambda s: get_regression_sql_repeat(mode, s),
+                settings
+            )
+
         if run_umbra:
-            def run_regression(name, query, compilationmode):
-                return run_umbra_benchmark(
+            run_umbra_regression('cxxudo', True)
+            run_umbra_regression('sql', True)
+            run_umbra_regression('umbra', True)
+        if run_umbra_wasm:
+            for name, settings in WASM_SETTINGS.items():
+                run_umbra_regression(f'wasmudo_{name}', True, settings)
+
+        def run_umbra_regression_threads(name, size, umbra_settings = None):
+            if name.startswith('wasmudo'):
+                mode = 'wasmudo'
+                num_iterations_factor = 8
+            else:
+                mode = name
+                num_iterations_factor = 2
+            settings = {'compilationmode': 'o', 'llvmoptimizer': 3}
+            if umbra_settings:
+                settings.update(umbra_settings)
+            for num_threads in range(2, cores_info.get_num_threads() + 1, 2):
+                settings['parallel'] = str(num_threads)
+                thread_list = cores_info.pick_threads(num_threads)
+                run_umbra_benchmark(
                     args.umbra_sql,
                     args.umbra_dbfile,
-                    name,
-                    LINEAR_REGRESSION_SIZES,
-                    lambda s: query.format(input_relation=f'xy_{s}'),
-                    {'compilationmode': compilationmode}
+                    name + '_regression_threads',
+                    [size],
+                    lambda s: get_regression_sql_repeat(mode, s),
+                    settings,
+                    max(1, min(10, num_threads // num_iterations_factor)),
+                    preexec_fn = lambda: os.sched_setaffinity(0, thread_list)
                 )
-            run_regression('udo_regression', UDO_REGRESSION_SQL, 'o')
-            run_regression('regression', REGRESSION_SQL, 'o')
-            run_regression('regression_2', REGRESSION_UMBRA_SQL, 'o')
 
-            cores_info = CoresInfo()
-
-            def run_regression_threads(name, query):
-                for num_threads in range(2, cores_info.get_num_threads() + 1, 2):
-                    thread_list = cores_info.pick_threads(num_threads)
-                    run_umbra_benchmark(
-                        args.umbra_sql,
-                        args.umbra_dbfile,
-                        name,
-                        [LINEAR_REGRESSION_SIZES[-1]],
-                        lambda s: query.format(input_relation=f'xy_{s}'),
-                        {
-                            'compilationmode': 'o',
-                            'parallel': str(num_threads),
-                        },
-                        preexec_fn = lambda: os.sched_setaffinity(0, thread_list)
-                    )
-            run_regression_threads('udo_regression_threads', UDO_REGRESSION_SQL)
-            run_regression_threads('regression_threads', REGRESSION_SQL)
-            run_regression_threads('regression_2_threads', REGRESSION_UMBRA_SQL)
+        if run_umbra:
+            run_umbra_regression_threads('cxxudo', LINEAR_REGRESSION_SIZES_LARGE[-1])
+            run_umbra_regression_threads('sql', LINEAR_REGRESSION_SIZES_LARGE[-1])
+            run_umbra_regression_threads('umbra', LINEAR_REGRESSION_SIZES_LARGE[-1])
+        if run_umbra_wasm:
+            for name, settings in WASM_SETTINGS.items():
+                run_umbra_regression_threads(f'wasmudo_{name}', LINEAR_REGRESSION_SIZES_LARGE[-1], settings)
 
         if run_postgres:
-            def run_regression(name, query):
+            def run_regression(mode):
                 return run_postgres_benchmark(
                     postgres_conn,
-                    name,
+                    mode + '_regression',
                     LINEAR_REGRESSION_SIZES,
-                    lambda s: query.format(input_relation=f'xy_{s}')
+                    lambda s: get_regression_sql_repeat('sql', s),
                 )
-            run_regression('udo_regression', UDO_REGRESSION_SQL)
-            run_regression('regression', REGRESSION_SQL)
+            run_regression('cxxudo')
+            run_regression('sql')
 
         if run_duckdb:
             run_duckdb_benchmark(
                 args.umbra_sql,
                 args.umbra_dbfile,
                 'regression',
-                lambda s: f'xy_{s}',
-                lambda s: REGRESSION_SQL.format(input_relation=f'xy_{s}'),
-                LINEAR_REGRESSION_SIZES
+                lambda s: f'xy_{min(LINEAR_REGRESSION_SIZES[-1], s)}',
+                lambda s: get_regression_sql_repeat('sql', s),
+                LINEAR_REGRESSION_SIZES + LINEAR_REGRESSION_SIZES_LARGE
             )
 
         if run_standalone:
@@ -897,7 +1059,7 @@ if __name__ == '__main__':
                 args.umbra_sql,
                 args.umbra_dbfile,
                 './regression-standalone',
-                'udo_regression',
+                'cxxudo_regression',
                 LINEAR_REGRESSION_SIZES,
                 lambda s: f'xy_{s}'
             )
@@ -914,53 +1076,75 @@ if __name__ == '__main__':
             )
 
     if 'words' in benchmarks:
+        def run_umbra_words(name, umbra_settings = None):
+            if name.startswith('wasmudo'):
+                mode = 'wasmudo'
+            else:
+                mode = name
+            settings = {'compilationmode': 'o', 'llvmoptimizer': 3}
+            if umbra_settings:
+                settings.update(umbra_settings)
+            return run_umbra_benchmark(
+                args.umbra_sql,
+                args.umbra_dbfile,
+                name + '_words',
+                WORDS_SIZES,
+                lambda s: get_words_sql(mode, f'words_{s}'),
+                settings
+            )
+
         if run_umbra:
-            def run_words(name, query, compilationmode):
-                return run_umbra_benchmark(
-                    args.umbra_sql,
-                    args.umbra_dbfile,
-                    name,
-                    WORDS_SIZES,
-                    lambda s: query.format(input_relation=f'words_{s}'),
-                    {'compilationmode': compilationmode}
-                )
-            run_words('udo_words', UDO_WORDS_SQL, 'o')
-            run_words('words', WORDS_SQL, 'o')
+            run_umbra_words('cxxudo')
+            run_umbra_words('sql')
+        if run_umbra_wasm:
+            for name, settings in WASM_SETTINGS.items():
+                run_umbra_words(f'wasmudo_{name}', settings)
 
         if run_duckdb:
             run_duckdb_benchmark(
                 args.umbra_sql,
                 args.umbra_dbfile,
-                'words',
+                'sql_words',
                 lambda s: f'words_{s}',
-                lambda s: WORDS_SQL.format(input_relation=f'words_{s}'),
+                lambda s: get_words_sql('sql', f'words_{s}'),
                 WORDS_SIZES
             )
 
         if run_postgres:
-            def run_words(name, query):
+            def run_words(mode):
                 return run_postgres_benchmark(
                     postgres_conn,
-                    name,
+                    mode + '_words',
                     WORDS_SIZES,
-                    lambda s: query.format(input_relation=f'words_{s}')
+                    lambda s: get_words_sql(mode, f'words_{s}'),
                 )
-            run_words('udo_words', UDO_WORDS_SQL)
-            run_words('words', WORDS_SQL)
+            run_words('cxxudo')
+            run_words('sql')
 
     if 'arrays' in benchmarks:
+        def run_umbra_arrays(name, umbra_settings = None):
+            if name.startswith('wasmudo'):
+                mode = 'wasmudo'
+            else:
+                mode = name
+            settings = {'compilationmode': 'o', 'llvmoptimizer': 3}
+            if umbra_settings:
+                settings.update(umbra_settings)
+            return run_umbra_benchmark(
+                args.umbra_sql,
+                args.umbra_dbfile,
+                name + '_arrays',
+                ARRAYS_SIZES,
+                lambda s: get_arrays_sql(mode, f'array_values_{s}'),
+                settings
+            )
+
         if run_umbra:
-            def run_arrays(name, query, compilationmode):
-                return run_umbra_benchmark(
-                    args.umbra_sql,
-                    args.umbra_dbfile,
-                    name,
-                    ARRAYS_SIZES,
-                    lambda s: query.format(input_relation=f'array_values_{s}'),
-                    {'compilationmode': compilationmode}
-                )
-            run_arrays('udo_arrays', UDO_ARRAYS_SQL, 'o')
-            run_arrays('arrays_recursive', ARRAYS_RECURSIVE_SQL, 'o')
+            run_umbra_arrays('cxxudo')
+            run_umbra_arrays('recursive_sql')
+        if run_umbra_wasm:
+            for name, settings in WASM_SETTINGS.items():
+                run_umbra_arrays(f'wasmudo_{name}', settings)
 
         if run_duckdb:
             run_duckdb_benchmark(
@@ -968,18 +1152,18 @@ if __name__ == '__main__':
                 args.umbra_dbfile,
                 'arrays_unnest',
                 lambda s: f'array_values_{s}',
-                lambda s: ARRAYS_DUCKDB_SQL.format(input_relation=f'array_values_{s}'),
+                lambda s: get_arrays_sql('duckdb', f'array_values_{s}'),
                 ARRAYS_SIZES
             )
 
         if run_postgres:
-            def run_arrays(name, query):
+            def run_arrays(mode):
                 return run_postgres_benchmark(
                     postgres_conn,
-                    name,
+                    mode + '_arrays',
                     ARRAYS_SIZES,
-                    lambda s: query.format(input_relation=f'array_values_{s}')
+                    lambda s: get_arrays_sql(mode, f'array_values_{s}')
                 )
-            run_arrays('udo_arrays', UDO_ARRAYS_SQL)
-            run_arrays('arrays_recursive', ARRAYS_RECURSIVE_SQL)
-            run_arrays('arrays_unnest', ARRAYS_POSTGRES_SQL)
+            run_arrays('cxxudo')
+            run_arrays('recursive_sql')
+            run_arrays('postgres')

@@ -5,7 +5,3 @@
 	path = postgres
 	url = https://github.com/tum-db/postgres.git
 	branch = udo
-[submodule "llvm"]
-	path = llvm
-	url = https://github.com/tum-db/llvm-project.git
-	branch = sichert/runtimedyld

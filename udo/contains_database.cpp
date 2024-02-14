@@ -5,20 +5,21 @@
 using namespace std;
 using namespace std::literals::string_view_literals;
 //---------------------------------------------------------------------------
-struct Tuple {
-   udo::String word;
-};
-//---------------------------------------------------------------------------
-class ContainsDatabase : public udo::UDOperator<Tuple, Tuple> {
+class ContainsDatabase : public udo::UDOperator {
    /// The word "database" that we are looking for
    static constexpr string_view databaseLower = "database"sv;
    /// The upper case letters for the database word
    static constexpr string_view databaseUpper = "DATABASE"sv;
 
    public:
+   struct InputTuple {
+      udo::String word;
+   };
+   using OutputTuple = InputTuple;
+
    /// Search for the word database, case-insensitively, by using a KMP search
    /// and only produce the tuple if the word was found.
-   void consume(LocalState& /*localState*/, const Tuple& input) {
+   void accept(udo::ExecutionState executionState, const InputTuple& input) {
       string_view word = input.word;
 
       // The current index in the input word
@@ -33,7 +34,7 @@ class ContainsDatabase : public udo::UDOperator<Tuple, Tuple> {
 
             if (patternIndex == databaseLower.size()) {
                // We found a match
-               produceOutputTuple(input);
+               emit<ContainsDatabase>(executionState, input);
                break;
             }
          } else {
@@ -51,4 +52,9 @@ class ContainsDatabase : public udo::UDOperator<Tuple, Tuple> {
       }
    }
 };
+//---------------------------------------------------------------------------
+#ifdef WASMUDO
+// plugin-wasmudo -generate-cxx-header -no-init -no-destroy -no-process ContainsDatabase 1 1 '' string 'word string' > wasmudo_contains_database.hpp
+#include "wasmudo_contains_database.hpp"
+#endif
 //---------------------------------------------------------------------------

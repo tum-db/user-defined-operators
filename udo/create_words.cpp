@@ -73,12 +73,7 @@ static constexpr array words = {
    "Visualization"sv,
 };
 //---------------------------------------------------------------------------
-/// The output of this operator
-struct Output {
-   udo::String word;
-};
-//---------------------------------------------------------------------------
-class CreateWords : public udo::UDOperator<udo::EmptyTuple, Output> {
+class CreateWords : public udo::UDOperator {
    private:
    /// The total number of words that should be generated
    uint64_t numWords;
@@ -86,11 +81,16 @@ class CreateWords : public udo::UDOperator<udo::EmptyTuple, Output> {
    atomic<uint64_t> wordCount = 0;
 
    public:
+   using InputTuple = udo::EmptyTuple;
+   struct OutputTuple {
+      udo::String word;
+   };
+
    /// Constructor
    explicit CreateWords(uint64_t numWords) : numWords(numWords) {}
 
    /// Produce the output
-   bool postProduce(LocalState& /*localState*/) {
+   bool process(udo::ExecutionState executionState) {
       uint64_t localWordCount = wordCount.fetch_add(10000);
       if (localWordCount >= numWords)
          return true;
@@ -110,14 +110,19 @@ class CreateWords : public udo::UDOperator<udo::EmptyTuple, Output> {
          word += ' ';
          word += to_string(randomNumberDistr(gen));
 
-         Output output;
+         OutputTuple output;
          output.word = string_view(word);
 
-         produceOutputTuple(output);
+         emit<CreateWords>(executionState, output);
       }
 
 
       return false;
    }
 };
+//---------------------------------------------------------------------------
+#ifdef WASMUDO
+// plugin-wasmudo -generate-cxx-header -no-destroy -no-accept CreateWords 16 8 i64 '' 'word string' > wasmudo_create_words.hpp
+#include "wasmudo_create_words.hpp"
+#endif
 //---------------------------------------------------------------------------

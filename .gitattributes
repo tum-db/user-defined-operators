@@ -1,2 +1,4 @@
 umbra/sql filter=lfs diff=lfs merge=lfs -text
 umbra/plugin-cxxudo filter=lfs diff=lfs merge=lfs -text
+umbra/plugin-wasmudo filter=lfs diff=lfs merge=lfs -text
+umbra/server filter=lfs diff=lfs merge=lfs -text
